@@ -22,6 +22,8 @@ module VX_issue_slice import VX_gpu_pkg::*; #(
     input wire              clk,
     input wire              reset,
 
+    input wire              no_pending_stores,
+
 `ifdef PERF_ENABLE
     output issue_perf_t     issue_perf,
 `endif
@@ -56,6 +58,8 @@ module VX_issue_slice import VX_gpu_pkg::*; #(
     ) scoreboard (
         .clk            (clk),
         .reset          (reset),
+        .no_pending_stores (no_pending_stores), // Connect the wire passed from VX_issue
+
     `ifdef PERF_ENABLE
         .perf_stalls    (issue_perf.scb_stalls),
         .perf_units_uses(issue_perf.units_uses),

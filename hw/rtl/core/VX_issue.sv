@@ -21,6 +21,8 @@ module VX_issue import VX_gpu_pkg::*; #(
     input wire              clk,
     input wire              reset,
 
+    input wire              lsu_no_pending_stores,
+
 `ifdef PERF_ENABLE
     output issue_perf_t     issue_perf,
 `endif
@@ -72,6 +74,9 @@ module VX_issue import VX_gpu_pkg::*; #(
             `SCOPE_IO_BIND(issue_id)
             .clk          (clk),
             .reset        (reset),
+            // --- NEW: Pass the signal down ---
+            .no_pending_stores (lsu_no_pending_stores),
+            
         `ifdef PERF_ENABLE
             .issue_perf   (per_issue_perf[issue_id]),
         `endif

@@ -255,7 +255,7 @@ module VX_scoreboard import VX_gpu_pkg::*; #(
     end
 
     // ========================================================================
-    // NEW: Extract atomic operation flags per warp
+    // Extract atomic operation flags per warp
     // ========================================================================
     
     wire [PER_ISSUE_WARPS-1:0] stg_is_lsu;
@@ -266,7 +266,7 @@ module VX_scoreboard import VX_gpu_pkg::*; #(
     for (genvar w = 0; w < PER_ISSUE_WARPS; ++w) begin : g_atomic_flags
         // Extract LSU operation arguments from staging buffer
         lsu_args_t lsu_args;
-        assign lsu_args = staging_if[w].data.op_args;
+        assign lsu_args = staging_if[w].data.op_args.lsu;
         
         // Check if this is an LSU instruction
         assign stg_is_lsu[w] = (staging_if[w].data.ex_type == EX_LSU);
@@ -315,7 +315,7 @@ module VX_scoreboard import VX_gpu_pkg::*; #(
     wire [PER_ISSUE_WARPS-1:0] issue_atomic_aq;
     for (genvar w = 0; w < PER_ISSUE_WARPS; ++w) begin : g_issue_aq
         assign issue_atomic_aq[w] = staging_if[w].valid && 
-                                    staging_if[w].ready && 
+                                    staging_if[w].ready &&  
                                     stg_is_amo[w] && 
                                     stg_amo_aq[w] &&
                                     operands_ready[w] &&
