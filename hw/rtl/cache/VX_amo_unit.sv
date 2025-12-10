@@ -72,10 +72,13 @@ module VX_amo_unit import VX_gpu_pkg::*; #(
     // FSM state definition
     typedef enum logic [2:0] {
         AMO_IDLE,
-        AMO_READ,
-        AMO_WAIT_READ,
-        AMO_COMPUTE,
-        AMO_WRITE,
+        AMO_SC_CHECK,       // Check Reservation Status (SC)
+        AMO_SC_FAIL,        // Handles SC failure/response path
+        AMO_LR_PROCESS,      // Handles LR Read/RSR update path
+        AMO_READ,       // RMW read/SC pre-check read
+        AMO_WAIT_READ,  // RMW wait
+        AMO_COMPUTE,    // RMW compute
+        AMO_WRITE,      // RMW write
         AMO_WAIT_WRITE,
         AMO_RESPOND
     } amo_state_t;
@@ -121,12 +124,42 @@ module VX_amo_unit import VX_gpu_pkg::*; #(
         case (amo_state)
             AMO_IDLE: begin
                 if (is_amo && core_req_ready) begin
-                    // For all AMO operations, we start with a read.
-                    // For LR and R-M-W ops, it's to get the old value.
-                    // For SC, it's a "read-for-ownership" to gain write permission to the cache line.
-                    amo_state_next = AMO_READ;
+                    if (amo_op == AMO_SC) begin
+                        amo_state_next = AMO_SC_CHECK; // Route to immediate check
+                    end else if (amo_op == AMO_LR) begin
+                        amo_state_next = AMO_LR_PROCESS; // Route to LR path
+                    end else begin
+                        amo_state_next = AMO_READ; // Route R-M-W to standard read
+                    end
                 end
             end
+            // --- NEW LR/SC Specific Paths (Phase IV) ---
+            AMO_SC_CHECK: begin
+                // Check success based on *current* incoming request vs RSR
+                wire current_sc_success = lr_reserved_valid 
+                                    && (lr_reserved_addr == core_req_addr) 
+                                    && (lr_reserved_gtid == amo_gtid);
+                if (!current_sc_success) begin
+                    // Reservation failed (snoop hit, mismatch, etc.) -> Fail immediately
+                    amo_state_next = AMO_SC_FAIL; 
+                end else begin
+                    // Reservation valid -> We must read the line first to gain ownership 
+                    // in the cache (if cacheable) before writing.
+                    amo_state_next = AMO_READ; 
+                end
+            end
+            
+            AMO_SC_FAIL: begin
+                // Final SC failure preparation (sets rsp_data=1)
+                amo_state_next = AMO_RESPOND;
+            end
+            
+            AMO_LR_PROCESS: begin
+                // LR requires a Read to RAM and RSR update 
+                amo_state_next = AMO_READ; // Use generic read pipe
+            end
+
+            // --- RMW & Cache Pipeline States ---    
             AMO_READ: begin
                 if (cache_req_valid && cache_req_ready) begin
                     amo_state_next = AMO_WAIT_READ;
@@ -141,7 +174,7 @@ module VX_amo_unit import VX_gpu_pkg::*; #(
                             amo_state_next = AMO_RESPOND;
                         end
                         AMO_SC: begin
-                            // For SC, after gaining ownership, go directly to write.
+                            // For SC, after gaining ownership, go directly to write. (it passed AMO_SC_CHECK initially)
                             amo_state_next = AMO_WRITE;
                         end
                         default: begin
@@ -177,7 +210,8 @@ module VX_amo_unit import VX_gpu_pkg::*; #(
     always_ff @(posedge clk) begin
         if (reset) begin
             amo_req_buf <= '0;
-        end else if (amo_state == AMO_IDLE && is_amo && core_req_ready) begin
+        // Latch request if we ACCEPT TRANSACTION AND CHANGE STATE
+        end else if (amo_state == AMO_IDLE && (amo_state_next!= AMO_IDLE) && is_amo && core_req_ready) begin
             amo_req_buf.tag        <= core_req_tag;
             amo_req_buf.addr       <= core_req_addr;
             amo_req_buf.gtid       <= amo_gtid;
@@ -205,8 +239,13 @@ module VX_amo_unit import VX_gpu_pkg::*; #(
             lr_reserved_gtid  <= '0; 
             lr_reserved_valid <= 1'b0;
         end else begin
+            // Snooping Invalidation (Highest Priority)
+            // If an invalidating write is seen on the core interface, clear the reservation.
+            if (snooping_invalidation_hit) begin 
+                lr_reserved_valid <= 1'b0;
+            end
             // Set reservation on LR completion
-            if (amo_state == AMO_WAIT_READ && amo_state_next == AMO_RESPOND && amo_req_buf.amo_op == AMO_LR) begin
+            else if (amo_state == AMO_WAIT_READ && amo_state_next == AMO_RESPOND && amo_req_buf.amo_op == AMO_LR) begin
                 lr_reserved_addr  <= amo_req_buf.addr;
                 lr_reserved_gtid  <= amo_req_buf.gtid;
                 lr_reserved_valid <= 1'b1;
@@ -223,10 +262,11 @@ module VX_amo_unit import VX_gpu_pkg::*; #(
                 lr_reserved_valid <= 1'b0;  // Already invalid, but confirm
             end
                 // CLEAR on intervening write from DIFFERENT thread
-            else if (lr_reserved_valid && amo_state == AMO_WRITE && amo_req_buf.amo_op != AMO_SC && cache_req_valid && cache_req_ready) begin
-                // Any non-SC write invalidates all other threads' reservations
-                lr_reserved_valid <= 1'b0;
-            end
+            // else if (lr_reserved_valid && amo_state == AMO_WRITE && amo_req_buf.amo_op != AMO_SC && cache_req_valid && cache_req_ready) begin
+            //     // Any non-SC write invalidates all other threads' reservations
+            //     lr_reserved_valid <= 1'b0;
+            // end
+            // ^ Non-SC invalidation should not depend on the FSM state.
 
             // // Clear reservation on any intervening write to the reserved address
             // else if (lr_reserved_valid && (amo_state == AMO_WRITE) && (amo_req_buf.addr == lr_reserved_addr) && (amo_req_buf.gtid == lr_reserved_gtid) && cache_req_valid && cache_req_ready) begin
@@ -253,6 +293,17 @@ module VX_amo_unit import VX_gpu_pkg::*; #(
         endcase
     end
 
+
+    // Define the Snooping Condition using incoming core request signals
+    // This logic checks for an incoming request that is a WRITE (core_req_rw = 1)
+    // AND is NOT an AMO operation.
+    wire incoming_is_standard_write = core_req_valid && core_req_rw &&!is_amo;
+    // Combined Snooping Hit Detection:
+    // Is there a reservation AND is an incoming standard write hitting the reserved address?
+    wire snooping_invalidation_hit = lr_reserved_valid && && incoming_is_standard_write && 
+                                 (core_req_addr == lr_reserved_addr) ; // TODO: Check what about gtid?
+
+
     // Core Request Interface
     assign core_req_ready = (amo_state == AMO_IDLE) ? (is_amo ? 1'b1 : cache_req_ready) : 1'b0;
 
@@ -260,9 +311,9 @@ module VX_amo_unit import VX_gpu_pkg::*; #(
     assign core_rsp_valid = (amo_state == AMO_IDLE) ? cache_rsp_valid : (amo_state == AMO_RESPOND);
     assign core_rsp_tag   = (amo_state == AMO_IDLE) ? cache_rsp_tag : amo_req_buf.tag;
     assign core_rsp_idx   = (amo_state == AMO_IDLE) ? cache_rsp_idx : amo_req_buf.idx;
-    assign core_rsp_data  = (amo_state == AMO_IDLE) ? cache_rsp_data :
+    assign core_rsp_data  = (amo_state == AMO_IDLE) ? cache_rsp_data : (amo_state == AMO_SC_FAIL)? {{WORD_WIDTH-1{1'b1}}, 1'b1} : // SC failure path should return 1 (non-success)
                             (amo_req_buf.amo_op == AMO_SC) ? {{WORD_WIDTH-1{1'b0}}, ~sc_success} : // SC returns 0 for success, 1 for failure
-                            amo_old_data; // Other AMOs return old value
+                            amo_old_data ; // Other AMOs return old value
 
     // Cache Request Interface
     assign cache_req_valid  = (amo_state == AMO_IDLE) ? core_req_valid :
