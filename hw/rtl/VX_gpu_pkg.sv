@@ -30,6 +30,9 @@ package VX_gpu_pkg;
 	localparam NT_WIDTH = `UP(NT_BITS);
 	localparam NB_WIDTH = `UP(NB_BITS);
 
+    // Define Global Thread ID Width
+    localparam GTID_WIDTH = `UP(NC_WIDTH + NW_WIDTH + NT_WIDTH); // SM_ID + Warp_ID + Lane_ID
+
     localparam XLENB    = `XLEN / 8;
 
 	localparam RV_REGS = 32;
@@ -100,8 +103,16 @@ package VX_gpu_pkg;
 
     localparam MEM_REQ_FLAG_FLUSH =  0;
     localparam MEM_REQ_FLAG_IO =     1;
-    localparam MEM_REQ_FLAG_LOCAL =  2; // shoud be last since optional
-    localparam MEM_FLAGS_WIDTH = (MEM_REQ_FLAG_LOCAL + `LMEM_ENABLED);
+    localparam MEM_REQ_FLAG_LOCAL =  2; // should be last since optional (for LMEM_ENABLED)
+    localparam MEM_REQ_FLAG_AMO    = 3;  // NEW: Indicates atomic operation
+    localparam MEM_REQ_FLAG_AMO_OP_START = 4;  // NEW: Start of 5-bit funct5
+    localparam MEM_REQ_FLAG_AMO_OP_END   = 8;  // NEW: End of funct5 (bits 4-8)
+    localparam MEM_REQ_FLAG_AQ             = 9;  // Acquire Bit
+    localparam MEM_REQ_FLAG_RL             = 10; // Release Bit
+    localparam MEM_REQ_FLAG_GTID = 11;
+    // localparam MEM_FLAGS_WIDTH = (MEM_REQ_FLAG_LOCAL + `LMEM_ENABLED);
+    localparam MEM_FLAGS_WIDTH = MEM_REQ_FLAG_RL + 1 + GTID_WIDTH;  // Now 11 bits
+
 
     localparam VX_DCR_ADDR_WIDTH = `VX_DCR_ADDR_BITS;
     localparam VX_DCR_DATA_WIDTH = 32;
@@ -142,6 +153,28 @@ package VX_gpu_pkg;
     localparam INST_FENCE =      7'b0001111; // Fence instructions
     localparam INST_SYS =        7'b1110011; // system instructions
 
+    ////////////////////////////////////  ATOMIC INSTRUCTIONS  //////////////////////////////////////////
+    localparam INST_AMO =        7'b0101111;  // RISC-V A Extension
+    // Define AMO funct5 codes (from RISC-V spec)
+    localparam [4:0] AMO_LR      = 5'b00010;
+    localparam [4:0] AMO_SC      = 5'b00011;
+    localparam [4:0] AMO_SWAP    = 5'b00001;
+    localparam [4:0] AMO_ADD     = 5'b00000;
+    localparam [4:0] AMO_XOR     = 5'b00100;
+    localparam [4:0] AMO_AND     = 5'b01100;
+    localparam [4:0] AMO_OR      = 5'b01000;
+    localparam [4:0] AMO_MIN     = 5'b10000;
+    localparam [4:0] AMO_MAX     = 5'b10100;
+    localparam [4:0] AMO_MINU    = 5'b11000;
+    localparam [4:0] AMO_MAXU    = 5'b11100;
+
+
+    // use the for remaining unused opcodes
+    localparam INST_LSU_AMO_LR    = 4'b0111;  // LR
+    localparam INST_LSU_AMO_SC    = 4'b1100;  // SC
+    localparam INST_LSU_AMO_ARITH = 4'b1101;  // ARITH
+    localparam INST_LSU_AMO_LOGIC = 4'b1110;  // LOGIC
+    
     // RV64I instruction specific opcodes (for any W instruction)
     localparam INST_I_W =        7'b0011011; // W type immediate instructions
     localparam INST_R_W =        7'b0111011; // W type register instructions
@@ -182,7 +215,7 @@ package VX_gpu_pkg;
     ///////////////////////////////////////////////////////////////////////////
 
     localparam INST_ALU_ADD =    4'b0000;
-    //localparam INST_ALU_UNUSED=4'b0001;
+    localparam INST_ALU_DOT8 = 4'b0001;
     localparam INST_ALU_LUI =    4'b0010;
     localparam INST_ALU_AUIPC =  4'b0011;
     localparam INST_ALU_SLTU =   4'b0100;
@@ -344,6 +377,11 @@ package VX_gpu_pkg;
         return (op[3:2] == 3);
     endfunction
 
+   // use a function to check if an lsu op is amo op
+    function automatic logic inst_lsu_is_amo(input logic [INST_LSU_BITS-1:0] op);
+        return (op == INST_LSU_AMO_LR) || (op == INST_LSU_AMO_SC) || (op == INST_LSU_AMO_ARITH) || (op == INST_LSU_AMO_LOGIC);
+    endfunction
+    
     ///////////////////////////////////////////////////////////////////////////
 
     localparam INST_FPU_ADD =    4'b0000; // SUB=fmt[1]
@@ -509,7 +547,14 @@ package VX_gpu_pkg;
     `PACKAGE_ASSERT($bits(fpu_args_t) == INST_ARGS_BITS)
 
     typedef struct packed {
-        logic [(INST_ARGS_BITS-1-1-OFFSET_BITS)-1:0] __padding;
+        logic [(INST_ARGS_BITS-1-1-OFFSET_BITS-1-5-1-1)-1:0] __padding;
+    
+        logic       is_amo;    // Atomic flag
+        logic [4:0] amo_op;    // funct5 (LR, SC, SWAP, etc.)
+        logic       aq;        // Acquire bit
+        logic       rl;        // Release bit
+        //logic [GTID_WIDTH-1:0] amo_gtid; 
+ 
         logic is_store;
         logic is_float;
         logic [OFFSET_BITS-1:0] offset;

@@ -20,6 +20,9 @@ module VX_issue_top import VX_gpu_pkg::*; #(
     input wire                              clk,
     input wire                              reset,
 
+    // --- NEW: Receive signal from Core/LSU ---
+    input wire                              lsu_no_pending_stores,
+
     input wire                              decode_valid,
     input wire [UUID_WIDTH-1:0]             decode_uuid,
     input wire [NW_WIDTH-1:0]               decode_wid,
@@ -143,6 +146,7 @@ module VX_issue_top import VX_gpu_pkg::*; #(
         .clk            (clk),
         .reset          (reset),
 
+        .lsu_no_pending_stores (lsu_no_pending_stores),
     `ifdef PERF_ENABLE
         .issue_perf     (issue_perf),
     `endif

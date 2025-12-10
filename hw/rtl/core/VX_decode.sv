@@ -85,6 +85,12 @@ module VX_decode import VX_gpu_pkg::*; #(
     wire [12:0] b_imm   = {instr[31], instr[7], instr[30:25], instr[11:8], 1'b0};
     wire [20:0] jal_imm = {instr[31], instr[19:12], instr[20], instr[30:21], 1'b0};
 
+                
+    // Extract instruction fields
+    wire [4:0] amo_funct5 = instr[31:27];
+    wire aq_bit = instr[26];
+    wire rl_bit = instr[25];
+
     reg [INST_ALU_BITS-1:0] r_type;
     always @(*) begin
         case (funct3)
@@ -467,6 +473,21 @@ module VX_decode import VX_gpu_pkg::*; #(
         `endif
             INST_EXT1: begin
                 case (funct7)
+                    7'h03: begin
+                        case (funct3)
+                            3'h0: begin // DOT8
+                                ex_type = EX_ALU;
+                                op_type = INST_ALU_DOT8;
+                                op_args.alu = '0;
+                                op_args.alu.xtype = ALU_TYPE_ARITH;
+                                use_rd = 1; 
+                                `USED_IREG (rd);
+                                `USED_IREG (rs1);
+                                `USED_IREG (rs2);
+                            end
+                            default:;
+                        endcase
+                    end
                     7'h00: begin
                         ex_type = EX_SFU;
                         is_wstall = 1;
@@ -536,6 +557,64 @@ module VX_decode import VX_gpu_pkg::*; #(
                 `endif
                     default:;
                 endcase
+            end
+
+            INST_AMO: begin
+                ex_type = EX_LSU;  // Route to LoadStore Unit
+                
+                case (amo_funct5)
+                    AMO_LR: begin
+                        op_type = INST_OP_BITS'(INST_LSU_AMO_LR);
+                        `USED_IREG(rs1); // LR requires rs1 as address
+                    end
+                    AMO_SC: begin
+                        op_type = INST_OP_BITS'(INST_LSU_AMO_SC);
+                        `USED_IREG(rs1); // SC requires rs1 as address
+                        `USED_IREG(rs2); // and rs2 as value to store
+                    end
+                    AMO_ADD,
+                    AMO_MIN,
+                    AMO_MAX,
+                    AMO_MINU,
+                    AMO_MAXU: begin
+                        op_type = INST_OP_BITS'(INST_LSU_AMO_ARITH); // arithmetical AMO ops
+                        `USED_IREG(rs1);
+                        `USED_IREG(rs2);
+                    end
+                    AMO_SWAP,
+                    AMO_XOR,
+                    AMO_AND,
+                    AMO_OR: begin
+                        op_type = INST_OP_BITS'(INST_LSU_AMO_LOGIC); // logical AMO ops
+                        `USED_IREG(rs1);
+                        `USED_IREG(rs2);
+                    end
+                    default: begin
+                        // unknown amo ops, trigger an exception
+                        ex_type = EX_SFU;
+                        op_type = INST_OP_BITS'(INST_SFU_TMC);
+                    end
+                endcase
+                 `USED_IREG(rd); 
+
+                use_rd  = 1'b1;
+                use_rs1 = 1'b1;
+                use_rs2 = 1'b1;
+                
+                // Populate LSU Arguments
+                op_args.lsu.is_store = 1'b0;     // Special request type  // TODO: Check
+                op_args.lsu.is_float = 1'b0;     // Integer atomics
+                op_args.lsu.offset   = 12'b0;    // AMOs don't use immediate offsets
+                
+                // NEW: Atomic-specific fields
+                op_args.lsu.is_amo   = 1'b1;
+                op_args.lsu.amo_op   = amo_funct5;
+                op_args.lsu.aq       = aq_bit;
+                op_args.lsu.rl       = rl_bit;
+                
+                // Control Signals
+                is_wstall = 1'b1;    // Stall - atomic ops are long-latency      
+
             end
             default:;
         endcase

@@ -20,6 +20,8 @@ module VX_scoreboard import VX_gpu_pkg::*; #(
     input wire              clk,
     input wire              reset,
 
+    input wire              no_pending_stores,
+
 `ifdef PERF_ENABLE
     output reg [PERF_CTR_BITS-1:0] perf_stalls,
     output reg [NUM_EX_UNITS-1:0][PERF_CTR_BITS-1:0] perf_units_uses,
@@ -39,6 +41,13 @@ module VX_scoreboard import VX_gpu_pkg::*; #(
 
     VX_ibuffer_if staging_if [PER_ISSUE_WARPS]();
     wire [PER_ISSUE_WARPS-1:0] operands_ready;
+
+    // Track which warps have atomic operations with .aq in flight
+    reg [PER_ISSUE_WARPS-1:0] atomic_aq_inflight;
+    
+    // Track the UUID for each warp's atomic operation to match writeback
+    reg [PER_ISSUE_WARPS-1:0][UUID_WIDTH-1:0] atomic_aq_uuid;
+
 
 `ifdef PERF_ENABLE
     reg [PER_ISSUE_WARPS-1:0][NUM_EX_UNITS-1:0] perf_inuse_units_per_cycle;
@@ -245,14 +254,128 @@ module VX_scoreboard import VX_gpu_pkg::*; #(
 
     end
 
+    // ========================================================================
+    // NEW: Extract atomic operation flags per warp
+    // ========================================================================
+    
+    wire [PER_ISSUE_WARPS-1:0] stg_is_lsu;
+    wire [PER_ISSUE_WARPS-1:0] stg_is_amo;
+    wire [PER_ISSUE_WARPS-1:0] stg_amo_aq;
+    wire [PER_ISSUE_WARPS-1:0] stg_amo_rl;
+    
+    for (genvar w = 0; w < PER_ISSUE_WARPS; ++w) begin : g_atomic_flags
+        // Extract LSU operation arguments from staging buffer
+        lsu_args_t lsu_args;
+        assign lsu_args = staging_if[w].data.op_args;
+        
+        // Check if this is an LSU instruction
+        assign stg_is_lsu[w] = (staging_if[w].data.ex_type == EX_LSU);
+        
+        // Check if this is an atomic operation
+        assign stg_is_amo[w] = stg_is_lsu[w] && lsu_args.is_amo;
+        
+        // Extract aq/rl flags (only valid for atomic operations)
+        assign stg_amo_aq[w] = lsu_args.aq;
+        assign stg_amo_rl[w] = lsu_args.rl;
+        `UNUSED_VAR (lsu_args)
+    end
+
+    // ========================================================================
+    // NEW: Atomic stall conditions per warp
+    // ========================================================================
+    
+    wire [PER_ISSUE_WARPS-1:0] stall_for_release;
+    wire [PER_ISSUE_WARPS-1:0] stall_for_acquire;
+    wire [PER_ISSUE_WARPS-1:0] atomic_stall;
+    
+    for (genvar w = 0; w < PER_ISSUE_WARPS; ++w) begin : g_atomic_stalls
+        
+        // Release (.rl) Stall Logic:
+        // When an atomic instruction has the .rl bit set, we must ensure
+        // all prior stores have completed before issuing this atomic.
+        assign stall_for_release[w] = staging_if[w].valid && 
+                                      stg_is_amo[w] && 
+                                      stg_amo_rl[w] && 
+                                      !no_pending_stores;
+        
+        // Acquire (.aq) Stall Logic:
+        // When an atomic instruction has the .aq bit set, we must block
+        // all subsequent instructions until this atomic completes.
+        assign stall_for_acquire[w] = atomic_aq_inflight[w];
+        
+        // Combined stall condition
+        assign atomic_stall[w] = stall_for_release[w] || stall_for_acquire[w];
+    end
+
+    // ========================================================================
+    // NEW: Track atomic .aq operations in flight
+    // ========================================================================
+    
+    // Detect when an atomic with .aq is being issued from staging buffer
+    wire [PER_ISSUE_WARPS-1:0] issue_atomic_aq;
+    for (genvar w = 0; w < PER_ISSUE_WARPS; ++w) begin : g_issue_aq
+        assign issue_atomic_aq[w] = staging_if[w].valid && 
+                                    staging_if[w].ready && 
+                                    stg_is_amo[w] && 
+                                    stg_amo_aq[w] &&
+                                    operands_ready[w] &&
+                                    !stall_for_release[w];
+    end
+    
+    // Detect when writeback completes the atomic for each warp
+    wire [PER_ISSUE_WARPS-1:0] writeback_clears_aq;
+    for (genvar w = 0; w < PER_ISSUE_WARPS; ++w) begin : g_wb_clear_aq
+        assign writeback_clears_aq[w] = writeback_if.valid && 
+                                        atomic_aq_inflight[w] &&
+                                        (writeback_if.data.wis == ISSUE_WIS_W'(w)) &&
+                                        (writeback_if.data.uuid == atomic_aq_uuid[w]) &&
+                                        writeback_if.data.eop;
+    end
+
+    wire [PER_ISSUE_WARPS-1:0][UUID_WIDTH-1:0] staging_uuid_flat;
+    
+    for (genvar w = 0; w < PER_ISSUE_WARPS; ++w) begin : g_extract_uuid
+        assign staging_uuid_flat[w] = staging_if[w].data.uuid;
+    end
+
+        // State machine for tracking .aq atomics
+    always @(posedge clk) begin
+        if (reset) begin
+            atomic_aq_inflight <= '0;
+            atomic_aq_uuid     <= '0;
+        end else begin
+            for (int i = 0; i < PER_ISSUE_WARPS; ++i) begin
+                // Set tracking when .aq atomic is issued
+                if (issue_atomic_aq[i]) begin
+                    atomic_aq_inflight[i] <= 1'b1;
+                    atomic_aq_uuid[i]     <= staging_uuid_flat[i];
+                // `ifdef DBG_TRACE_PIPELINE
+                //     `TRACE(2, ("%t: %s-scoreboard: atomic .aq issued, wid=%0d, PC=0x%0h, uuid=%0d\n",
+                //         $time, INSTANCE_ID, i, to_fullPC(staging_if[i].data.PC), staging_if[i].data.uuid))
+                // `endif
+                end
+                
+                // Clear tracking when writeback arrives
+                if (writeback_clears_aq[i]) begin
+                    atomic_aq_inflight[i] <= 1'b0;
+                // `ifdef DBG_TRACE_PIPELINE
+                //     `TRACE(2, ("%t: %s-scoreboard: atomic .aq completed, wid=%0d, PC=0x%0h, uuid=%0d\n",
+                //         $time, INSTANCE_ID, i, to_fullPC(writeback_if.data.PC), writeback_if.data.uuid))
+                // `endif
+                end
+            end
+        end
+    end
+
+
     wire [PER_ISSUE_WARPS-1:0] arb_valid_in;
     wire [PER_ISSUE_WARPS-1:0][IN_DATAW-1:0] arb_data_in;
     wire [PER_ISSUE_WARPS-1:0] arb_ready_in;
 
     for (genvar w = 0; w < PER_ISSUE_WARPS; ++w) begin : g_arb_data_in
-        assign arb_valid_in[w] = staging_if[w].valid && operands_ready[w];
+        assign arb_valid_in[w] = staging_if[w].valid && operands_ready[w] && !atomic_stall[w];
         assign arb_data_in[w] = staging_if[w].data;
-        assign staging_if[w].ready = arb_ready_in[w] && operands_ready[w];
+        assign staging_if[w].ready = arb_ready_in[w] && operands_ready[w] && !atomic_stall[w];
     end
 
     VX_stream_arb #(

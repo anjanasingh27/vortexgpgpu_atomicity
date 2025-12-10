@@ -421,6 +421,11 @@
 `define LSUQ_OUT_SIZE   `MAX(`LSUQ_IN_SIZE, `LSU_LINE_SIZE / (`XLEN / 8))
 `endif
 
+// Update hw/rtl/VX_config.vh to define LATENCY_DOT8 as 2
+`ifndef LATENCY_DOT8
+`define LATENCY_DOT8 2
+`endif
+
 // Floating-Point Units ///////////////////////////////////////////////////////
 
 // Size of FPU Request Queue

@@ -22,6 +22,8 @@ module VX_execute import VX_gpu_pkg::*; #(
     input wire              clk,
     input wire              reset,
 
+    output wire             no_pending_stores,
+
 `ifdef PERF_ENABLE
     input sysmem_perf_t     sysmem_perf,
     input pipeline_perf_t   pipeline_perf,
@@ -64,11 +66,15 @@ module VX_execute import VX_gpu_pkg::*; #(
     `SCOPE_IO_SWITCH (1);
 
     VX_lsu_unit #(
+        .CORE_ID (CORE_ID),
         .INSTANCE_ID (`SFORMATF(("%s-lsu", INSTANCE_ID)))
     ) lsu_unit (
         `SCOPE_IO_BIND  (0)
         .clk            (clk),
         .reset          (reset),
+
+        .no_pending_stores (no_pending_stores),
+        
         .dispatch_if    (dispatch_if[EX_LSU * `ISSUE_WIDTH +: `ISSUE_WIDTH]),
         .commit_if      (commit_if[EX_LSU * `ISSUE_WIDTH +: `ISSUE_WIDTH]),
         .lsu_mem_if     (lsu_mem_if)

@@ -33,6 +33,9 @@ module VX_cache import VX_gpu_pkg::*; #(
     // Size of a word in bytes
     parameter WORD_SIZE             = 16,
 
+    // AMO ENABLE
+    parameter AMO_ENABLE            = 0,
+
     // Core Response Queue Size
     parameter CRSQ_SIZE             = 4,
     // Miss Reserv Queue Knob
@@ -90,7 +93,7 @@ module VX_cache import VX_gpu_pkg::*; #(
     localparam BANK_SEL_BITS   = `CLOG2(NUM_BANKS);
     localparam BANK_SEL_WIDTH  = `UP(BANK_SEL_BITS);
     localparam LINE_ADDR_WIDTH = (`CS_WORD_ADDR_WIDTH - BANK_SEL_BITS - WORD_SEL_BITS);
-    localparam CORE_REQ_DATAW  = LINE_ADDR_WIDTH + 1 + WORD_SEL_WIDTH + WORD_SIZE + WORD_WIDTH + TAG_WIDTH + `UP(MEM_FLAGS_WIDTH);
+    localparam CORE_REQ_DATAW  = LINE_ADDR_WIDTH + 1 + WORD_SEL_WIDTH + WORD_SIZE + WORD_WIDTH + TAG_WIDTH + `UP(MEM_FLAGS_WIDTH);  // TODO: Check how to add (GTID_WIDTH)
     localparam CORE_RSP_DATAW  = WORD_WIDTH + TAG_WIDTH;
     localparam BANK_MEM_TAG_WIDTH = UUID_WIDTH + MSHR_ADDR_WIDTH;
     localparam MEM_REQ_DATAW   = (`CS_LINE_ADDR_WIDTH + 1 + LINE_SIZE + `CS_LINE_WIDTH + BANK_MEM_TAG_WIDTH + `UP(MEM_FLAGS_WIDTH));
@@ -240,6 +243,10 @@ module VX_cache import VX_gpu_pkg::*; #(
     wire [NUM_BANKS-1:0][`UP(MEM_FLAGS_WIDTH)-1:0]  per_bank_core_req_flags;
     wire [NUM_BANKS-1:0]                        per_bank_core_req_ready;
 
+    // // gtid declaration for each bank
+    // wire [NUM_BANKS-1:0][VX_gpu_pkg::GTID_WIDTH-1:0]        per_bank_core_req_gtid;
+
+
     wire [NUM_BANKS-1:0]                        per_bank_core_rsp_valid;
     wire [NUM_BANKS-1:0][`CS_WORD_WIDTH-1:0]    per_bank_core_rsp_data;
     wire [NUM_BANKS-1:0][TAG_WIDTH-1:0]         per_bank_core_rsp_tag;
@@ -311,6 +318,7 @@ module VX_cache import VX_gpu_pkg::*; #(
             core_req_data[i],
             core_req_tag[i],
             core_req_flags[i]
+        //     core_req_gtid[i]  // added gtid in request
         };
     end
 
@@ -354,12 +362,166 @@ module VX_cache import VX_gpu_pkg::*; #(
             per_bank_core_req_data[i],
             per_bank_core_req_tag[i],
             per_bank_core_req_flags[i]
+            // per_bank_core_req_gtid[i]   // added as part of the flags
         } = core_req_data_out[i];
     end
 
     // Banks access ///////////////////////////////////////////////////////////
 
     for (genvar bank_id = 0; bank_id < NUM_BANKS; ++bank_id) begin : g_banks
+    if (AMO_ENABLE) begin : g_amo_unit_per_bank
+        // instantiate amo_unit and cache bank with updated signal flow
+
+        // Wires connecting AMO unit <-> cache bank
+        wire                                amo_to_bank_req_valid;
+        wire [`CS_LINE_ADDR_WIDTH-1:0]      amo_to_bank_req_addr;
+        wire                                amo_to_bank_req_rw;
+        wire [WORD_SEL_WIDTH-1:0]           amo_to_bank_req_wsel;
+        wire [WORD_SIZE-1:0]                amo_to_bank_req_byteen;
+        wire [`CS_WORD_WIDTH-1:0]           amo_to_bank_req_data;
+        wire [TAG_WIDTH-1:0]                amo_to_bank_req_tag;
+        wire [REQ_SEL_WIDTH-1:0]            amo_to_bank_req_idx;
+        wire [`UP(MEM_FLAGS_WIDTH)-1:0]     amo_to_bank_req_flags;
+        wire                                amo_to_bank_req_ready;
+
+        wire                                bank_to_amo_rsp_valid;
+        wire [`CS_WORD_WIDTH-1:0]           bank_to_amo_rsp_data;
+        wire [TAG_WIDTH-1:0]                bank_to_amo_rsp_tag;
+        wire [REQ_SEL_WIDTH-1:0]            bank_to_amo_rsp_idx;
+        wire                                bank_to_amo_rsp_ready;
+
+
+        // amo unit
+        VX_amo_unit #(
+            .BANK_ID            (bank_id),
+            .INSTANCE_ID        (`SFORMATF(("%s-amo_unit%0d", INSTANCE_ID, bank_id))),
+            .TAG_WIDTH          (TAG_WIDTH),
+            .WORD_WIDTH         (`CS_WORD_WIDTH),
+            .ADDR_WIDTH         (`CS_LINE_ADDR_WIDTH),
+            // .GTID_WIDTH         (VX_gpu_pkg::GTID_WIDTH), // TODO - done
+            // .MEM_FLAGS_WIDTH    (MEM_FLAGS_WIDTH),
+            .WORD_SEL_WIDTH     (WORD_SEL_WIDTH),
+            .REQ_SEL_WIDTH      (REQ_SEL_WIDTH),
+            .CS_LINE_ADDR_WIDTH (`CS_LINE_ADDR_WIDTH),
+            .WORD_SIZE          (WORD_SIZE)
+        ) amo_unit (
+            .clk(clk),
+            .reset(reset),
+
+            // from core/xbar
+            .core_req_valid     (per_bank_core_req_valid[bank_id]),
+            .core_req_tag       (per_bank_core_req_tag[bank_id]),
+            .core_req_addr      (per_bank_core_req_addr[bank_id]),
+            .core_req_rw        (per_bank_core_req_rw[bank_id]),
+            .core_req_byteen    (per_bank_core_req_byteen[bank_id]),
+            .core_req_data      (per_bank_core_req_data[bank_id]),
+            .core_req_flags     (per_bank_core_req_flags[bank_id]),
+            .core_req_wsel      (per_bank_core_req_wsel[bank_id]),
+            .core_req_idx       (per_bank_core_req_idx[bank_id]),
+            .core_req_ready     (per_bank_core_req_ready[bank_id]),
+
+            // .core_req_gtid      (per_bank_core_req_gtid[bank_id]),   // GTID signal added; update: added as part of flags
+
+            // to core/xbar
+            .core_rsp_valid     (per_bank_core_rsp_valid[bank_id]),
+            .core_rsp_tag       (per_bank_core_rsp_tag[bank_id]),
+            .core_rsp_data      (per_bank_core_rsp_data[bank_id]),
+            .core_rsp_idx       (per_bank_core_rsp_idx[bank_id]),
+            .core_rsp_ready     (per_bank_core_rsp_ready[bank_id]),
+
+            // to cache bank
+            .cache_req_valid    (amo_to_bank_req_valid),
+            .cache_req_tag      (amo_to_bank_req_tag),
+            .cache_req_addr     (amo_to_bank_req_addr),
+            .cache_req_rw       (amo_to_bank_req_rw),
+            .cache_req_byteen   (amo_to_bank_req_byteen),
+            .cache_req_data     (amo_to_bank_req_data),
+            .cache_req_flags    (amo_to_bank_req_flags),
+            .cache_req_wsel     (amo_to_bank_req_wsel),
+            .cache_req_idx      (amo_to_bank_req_idx),
+            .cache_req_ready    (amo_to_bank_req_ready),
+
+            // from cache bank
+            .cache_rsp_valid    (bank_to_amo_rsp_valid),
+            .cache_rsp_tag      (bank_to_amo_rsp_tag),
+            .cache_rsp_data     (bank_to_amo_rsp_data),
+            .cache_rsp_idx      (bank_to_amo_rsp_idx),
+            .cache_rsp_ready    (bank_to_amo_rsp_ready)
+        );
+
+        // vx_cache_bank, connect to amo_unit
+        VX_cache_bank #(
+            .BANK_ID      (bank_id),
+            .INSTANCE_ID  (`SFORMATF(("%s-bank%0d", INSTANCE_ID, bank_id))),
+            .CACHE_SIZE   (CACHE_SIZE),
+            .LINE_SIZE    (LINE_SIZE),
+            .NUM_BANKS    (NUM_BANKS),
+            .NUM_WAYS     (NUM_WAYS),
+            .WORD_SIZE    (WORD_SIZE),
+            .NUM_REQS     (NUM_REQS),
+            .WRITE_ENABLE (WRITE_ENABLE),
+            .WRITEBACK    (WRITEBACK),
+            .DIRTY_BYTES  (DIRTY_BYTES),
+            .REPL_POLICY  (REPL_POLICY),
+            .CRSQ_SIZE    (CRSQ_SIZE),
+            .MSHR_SIZE    (MSHR_SIZE),
+            .MREQ_SIZE    (MREQ_SIZE),
+            .TAG_WIDTH    (TAG_WIDTH),
+            .CORE_OUT_REG (CORE_RSP_BUF_ENABLE ? 0 : `TO_OUT_BUF_REG(CORE_OUT_BUF)),
+            .MEM_OUT_REG  (MEM_REQ_BUF_ENABLE ? 0 : `TO_OUT_BUF_REG(MEM_OUT_BUF))
+        ) bank (
+            .clk                (clk),
+            .reset              (reset),
+
+        `ifdef PERF_ENABLE
+            .perf_read_miss    (perf_read_miss_per_bank[bank_id]),
+            .perf_write_miss   (perf_write_miss_per_bank[bank_id]),
+            .perf_mshr_stall   (perf_mshr_stall_per_bank[bank_id]),
+        `endif
+
+            
+            .core_req_valid     (amo_to_bank_req_valid),
+            .core_req_addr      (amo_to_bank_req_addr),
+            .core_req_rw        (amo_to_bank_req_rw),
+            .core_req_wsel      (amo_to_bank_req_wsel),
+            .core_req_byteen    (amo_to_bank_req_byteen),
+            .core_req_data      (amo_to_bank_req_data),
+            .core_req_tag       (amo_to_bank_req_tag),
+            .core_req_idx       (amo_to_bank_req_idx),
+            .core_req_flags     (amo_to_bank_req_flags),
+            .core_req_ready     (amo_to_bank_req_ready),
+
+            
+            .core_rsp_valid     (bank_to_amo_rsp_valid),
+            .core_rsp_data      (bank_to_amo_rsp_data),
+            .core_rsp_tag       (bank_to_amo_rsp_tag),
+            .core_rsp_idx       (bank_to_amo_rsp_idx),
+            .core_rsp_ready     (bank_to_amo_rsp_ready),
+
+            
+            .mem_req_valid      (per_bank_mem_req_valid[bank_id]),
+            .mem_req_addr       (per_bank_mem_req_addr[bank_id]),
+            .mem_req_rw         (per_bank_mem_req_rw[bank_id]),
+            .mem_req_byteen     (per_bank_mem_req_byteen[bank_id]),
+            .mem_req_data       (per_bank_mem_req_data[bank_id]),
+            .mem_req_tag        (per_bank_mem_req_tag[bank_id]),
+            .mem_req_flags      (per_bank_mem_req_flags[bank_id]),
+            .mem_req_ready      (per_bank_mem_req_ready[bank_id]),
+
+            
+            .mem_rsp_valid      (per_bank_mem_rsp_valid[bank_id]),
+            .mem_rsp_data       (per_bank_mem_rsp_data[bank_id]),
+            .mem_rsp_tag        (per_bank_mem_rsp_tag[bank_id]),
+            .mem_rsp_ready      (per_bank_mem_rsp_ready[bank_id]),
+
+            
+            .flush_begin        (per_bank_flush_begin[bank_id]),
+            .flush_uuid         (flush_uuid),
+            .flush_end          (per_bank_flush_end[bank_id])
+        );
+
+    end
+    else begin: g_no_amo
         VX_cache_bank #(
             .BANK_ID      (bank_id),
             .INSTANCE_ID  (`SFORMATF(("%s-bank%0d", INSTANCE_ID, bank_id))),
@@ -429,6 +591,7 @@ module VX_cache import VX_gpu_pkg::*; #(
             .flush_uuid         (flush_uuid),
             .flush_end          (per_bank_flush_end[bank_id])
         );
+    end
     end
 
     // Core responses gather //////////////////////////////////////////////////

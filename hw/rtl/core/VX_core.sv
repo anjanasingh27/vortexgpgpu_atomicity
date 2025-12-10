@@ -138,6 +138,8 @@ module VX_core import VX_gpu_pkg::*; #(
         .decode_sched_if(decode_sched_if)
     );
 
+    wire lsu_no_pending_stores;
+
     VX_issue #(
         .INSTANCE_ID (`SFORMATF(("%s-issue", INSTANCE_ID)))
     ) issue (
@@ -145,6 +147,8 @@ module VX_core import VX_gpu_pkg::*; #(
 
         .clk            (clk),
         .reset          (reset),
+
+        .lsu_no_pending_stores (lsu_no_pending_stores),
 
     `ifdef PERF_ENABLE
         .issue_perf     (pipeline_perf.issue),
@@ -164,6 +168,8 @@ module VX_core import VX_gpu_pkg::*; #(
 
         .clk            (clk),
         .reset          (reset),
+
+        .no_pending_stores (lsu_no_pending_stores),
 
     `ifdef PERF_ENABLE
         .sysmem_perf    (sysmem_perf_tmp),

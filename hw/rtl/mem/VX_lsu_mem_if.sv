@@ -33,7 +33,7 @@ interface VX_lsu_mem_if import VX_gpu_pkg::*; #(
         logic [NUM_LANES-1:0][ADDR_WIDTH-1:0]  addr;
         logic [NUM_LANES-1:0][DATA_SIZE*8-1:0] data;
         logic [NUM_LANES-1:0][DATA_SIZE-1:0]   byteen;
-        logic [NUM_LANES-1:0][FLAGS_WIDTH-1:0] flags;
+        logic [NUM_LANES-1:0][FLAGS_WIDTH-1:0] flags;   // note: We now have this flag containing the GTID as well
         tag_t                                  tag;
     } req_data_t;
 
